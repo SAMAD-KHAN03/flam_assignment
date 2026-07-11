@@ -1,5 +1,3 @@
-
-
 function handleConfig(args) {
   const action = args[0]; // 'set'
   if (action === 'set') {

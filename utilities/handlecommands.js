@@ -1,15 +1,16 @@
 // 1. Import handlers from the modular files
-const  handleEnqueue  = require("../utilities/enqueue");
-const  handleWorker  = require("../utilities/worker");
-const  handleStatus  = require("../utilities/status");
-const  handleList  = require("../utilities/list");
-const  handleDlq  = require("../utilities/dlq");
-const  handleConfig  = require("../utilities/config");
+const handleEnqueue = require("../utilities/enqueue");
+const handleWorker = require("../utilities/worker");
+const handleStatus = require("../utilities/status");
+const handleList = require("../utilities/list");
+const handleDlq = require("../utilities/dlq");
+const handleConfig = require("../utilities/config");
 function handleCommands(argv) {
-  // 1. Capture the primary command from the terminal arguments
-  // Example: in 'node queuectl.js worker start', command is 'worker'
   const command = argv[2];
+  // console.log('the command is ',command);
+  
   const subArgs = argv.slice(3);
+// console.log('subargs are ',subArgs);
 
   switch (command) {
     case "enqueue":
@@ -20,6 +21,9 @@ function handleCommands(argv) {
       handleWorker(subArgs);
       break;
 
+    case "_child_internal":
+      handleWorker(["_child_internal"]);
+      break;
     case "status":
       handleStatus();
       break;
@@ -37,7 +41,7 @@ function handleCommands(argv) {
       break;
 
     default:
-      printHelp();
+      // printHelp();
       process.exit(1);
   }
 }
