@@ -49,7 +49,6 @@ function handleWorker(args) {
       `[Worker Process] Booted and registered unique PID: ${currentPid}`,
     );
 
-    // Clean up registry if process is closed manually (Ctrl+C) [cite: 44]
     process.on("SIGINT", () => {
       try {
         db.prepare("DELETE FROM active_workers WHERE pid = ?").run(currentPid);
@@ -61,65 +60,116 @@ function handleWorker(args) {
       try {
         const currentTime = new Date().toISOString();
 
-        // ATOMIC OPERATION BLOCK: Claim a job uniquely across separate processes [cite: 67, 68, 104]
-        // We look for jobs that are pending/failed and ready to run, OR processing jobs that crashed (expired timeout) [cite: 34, 36]
-        const claimTransaction = db.transaction(() => {
-          const selectJob = db.prepare(`
-            SELECT * FROM jobs 
-            WHERE (state = 'pending' OR state = 'failed') AND run_at <= ?
-            OR (state = 'processing' AND locked_until <= ?)
-            LIMIT 1
-          `);
+        // 1. Pack the inline transaction into an executable function wrapper
+        const claimTransaction = () => {
+          db.exec("BEGIN IMMEDIATE;");
+          try {
+            const job = db
+              .prepare(
+                `
+              SELECT * FROM jobs 
+              WHERE (state = 'pending' OR state = 'failed') AND run_at <= ?
+                 OR (state = 'processing' AND locked_until <= ?)
+              LIMIT 1
+            `,
+              )
+              .get(currentTime, currentTime);
 
-          const job = selectJob.get(currentTime, currentTime);
-          if (!job) return null;
+            if (!job) {
+              db.exec("COMMIT;");
+              return null;
+            }
 
-          // Immediately lock the job for 30 seconds to satisfy the Crash Rule [cite: 35, 36, 37]
-          const visibilityTimeout = new Date(Date.now() + 30000).toISOString();
+            const visibilityTimeout = new Date(
+              Date.now() + 30000,
+            ).toISOString();
 
-          db.prepare(
-            `
-            UPDATE jobs 
-            SET state = 'processing', locked_until = ?, updated_at = ? 
-            WHERE id = ?
-          `,
-          ).run(visibilityTimeout, currentTime, job.id);
+            db.prepare(
+              `
+              UPDATE jobs 
+              SET state = 'processing', locked_until = ?, updated_at = ? 
+              WHERE id = ?
+            `,
+            ).run(visibilityTimeout, currentTime, job.id);
 
-          return job;
-        });
+            db.exec("COMMIT;");
+            return job;
+          } catch (err) {
+            db.exec("ROLLBACK;");
+            throw err;
+          }
+        };
 
-        // Run the atomic transaction block safely
-        const assignedJob = claimTransaction();
+        // 2. Safely capture the return object while handling transient file locks
+        let assignedJob = null;
+        try {
+          assignedJob = claimTransaction();
+        } catch (lockError) {
+          if (
+            lockError.code === "ERR_SQLITE_ERROR" &&
+            lockError.message.includes("locked")
+          ) {
+            return; // Back out quietly and let the other process finish writing
+          }
+          throw lockError;
+        }
 
+        // 3. Natively execute the job payload command string inside an OS shell
         if (assignedJob) {
           console.log(
             `[Worker ${currentPid}] ⚡ Claimed job: "${assignedJob.id}". Executing...`,
           );
 
-          // Natively spawn an OS sub-shell execution environment
           const { exec } = require("node:child_process");
 
           exec(assignedJob.command, (error, stdout, stderr) => {
             const finishedTime = new Date().toISOString();
 
             if (!error) {
-              // --- THE HAPPY PATH COMPLETION ---
               console.log(
                 `[Worker ${currentPid}] ✅ Job "${assignedJob.id}" executed successfully.`,
               );
 
               db.prepare(
                 `
-        UPDATE jobs 
-        SET state = 'completed', attempts = attempts + 1, updated_at = ? 
-        WHERE id = ?
-      `,
+                UPDATE jobs 
+                SET state = 'completed', attempts = attempts + 1, updated_at = ? 
+                WHERE id = ?
+              `,
               ).run(finishedTime, assignedJob.id);
             } else {
-              // --- CRASH/ERROR PLACEHOLDER ---
               console.error(
-                `[Worker ${currentPid}] ❌ Job "${assignedJob.id}" failed execution.`,
+                `[Worker ${currentPid}] Job "${assignedJob.id}" failed execution.`,
               );
+              const nextAttempt = assignedJob.attempts + 1;
+              if (nextAttempt >= assignedJob.max_retries) {
+                console.error(
+                  `[Worker ${currentPid}]  Job "${assignedJob.id}" failed permanently after ${nextAttempt}/${assignedJob.max_retries} attempts. Moving to DLQ.`,
+                );
+                db.prepare(
+                  `
+                  UPDATE jobs 
+                  SET state = 'dead', attempts = ?, updated_at = ? 
+                  WHERE id = ?
+                `,
+                ).run(nextAttempt, finishedTime, assignedJob.id);
+              } else {
+                const backoffSeconds = Math.pow(2, nextAttempt);
+                const futureRunTime = new Date(
+                  Date.now() + backoffSeconds * 1000,
+                ).toISOString();
+                console.warn(
+                  `[Worker ${currentPid}F] Job "${assignedJob.id}" failed (Attempt ${nextAttempt}/${assignedJob.max_retries}). Retrying in ${backoffSeconds}s...`,
+                );
+
+                db.prepare(
+                  `
+                  UPDATE jobs 
+                  SET state = 'failed', attempts = ?, run_at = ?, updated_at = ? 
+                  WHERE id = ?
+                `,
+                ).run(nextAttempt, futureRunTime, finishedTime, assignedJob.id);
+              }
             }
           });
         }
@@ -128,7 +178,7 @@ function handleWorker(args) {
           `[Worker ${currentPid}] Error during polling: ${error.message}`,
         );
       }
-    }, 1000); // Poll every second to stay responsive [cite: 37]
+    }, 1000); // Poll every second to stay responsive [
   } else if (action === "stop") {
     // 3. Global Stop Logic [cite: 42, 47]
     const rows = db.prepare("SELECT pid FROM active_workers").all();
