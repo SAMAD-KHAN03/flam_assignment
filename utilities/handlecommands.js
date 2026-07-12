@@ -1,16 +1,14 @@
-// 1. Import handlers from the modular files
 const handleEnqueue = require("../utilities/enqueue");
 const handleWorker = require("../utilities/worker");
 const handleStatus = require("../utilities/status");
 const handleList = require("../utilities/list");
 const handleDlq = require("../utilities/dlq");
 const handleConfig = require("../utilities/config");
+const handleHelp = require("../utilities/help"); // Import the help manual
+
 function handleCommands(argv) {
   const command = argv[2];
-  // console.log('the command is ',command);
-  
   const subArgs = argv.slice(3);
-// console.log('subargs are ',subArgs);
 
   switch (command) {
     case "enqueue":
@@ -24,6 +22,7 @@ function handleCommands(argv) {
     case "_child_internal":
       handleWorker(["_child_internal"]);
       break;
+
     case "status":
       handleStatus();
       break;
@@ -40,9 +39,16 @@ function handleCommands(argv) {
       handleConfig(subArgs);
       break;
 
+    case "help":
+    case "--help":
+    case "-h":
+      handleHelp();
+      break;
+
     default:
-      // printHelp();
-      process.exit(1);
+      console.log(`⚠️  Unknown command: "${command || ''}"`);
+      handleHelp(); // Fall back to printing the guide safely
   }
 }
+
 module.exports = handleCommands;
