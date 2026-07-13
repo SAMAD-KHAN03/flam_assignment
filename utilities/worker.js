@@ -7,6 +7,8 @@ function handleWorker(args) {
   const action = args[0]; // 'start' or 'stop'
 
   if (action === "start") {
+    recoverStaleJobs(); 
+
     // 1. Parse the count argument dynamically
     const countIndex = args.indexOf("count");
     const workerCount =
@@ -234,3 +236,27 @@ function handleWorker(args) {
 }
 
 module.exports = handleWorker;
+function recoverStaleJobs() {
+  const now = new Date().toISOString();
+
+  // Any job still 'processing' is orphaned — the PID that held it is gone
+  // now that the whole app restarted, so don't wait out locked_until.
+  const result = db
+    .prepare(
+      `
+    UPDATE jobs
+    SET state = 'pending', locked_until = NULL, run_at = ?, updated_at = ?
+    WHERE state = 'processing'
+  `,
+    )
+    .run(now, now);
+
+  if (result.changes > 0) {
+    console.log(
+      `[Recovery] Reclaimed ${result.changes} orphaned job(s) from a previous run.`,
+    );
+  }
+
+  // Previous active_workers rows are stale PIDs from before the restart
+  db.exec("DELETE FROM active_workers;");
+}
