@@ -1,5 +1,5 @@
-./run_all_commands.sh
-./queue.db
-./queue.db-shm
-./queue.db-wal
-./result.txt
+run_all_commands.sh
+queue.db
+queue.db-shm
+queue.db-wal
+result.txt
