@@ -22,6 +22,7 @@ The engine operates on a shared-storage daemon cluster architecture. When multip
 - **Infinite Loop Mitigation:** The worker configuration utilizes the native `timeout: 10000` option within `child_process.exec`. If a task command runs for more than 10 seconds without returning, the OS kernel intercepts it, fires a `SIGTERM` to kill the sub-shell process cleanly, and cycles the job back into the error-handling path without hanging the worker daemon.
 - **Clock Drift Resolution:** To guarantee absolute sync across isolated processing loops, the system eliminates local system time calculations during queries. It delegates time checking directly to SQLite's internal engine using `STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')`, creating a single, atomic source of truth for visibility lock states across all parallel OS contexts.
 
+## check out the video here:https://drive.google.com/file/d/1QGtEPuK8Gm_ReD0C83JiEnBuFxJNXfdi/view?usp=sharing
 ## ⚙️ Installation & Setup
 
 ### System Prerequisites
