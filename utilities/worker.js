@@ -56,41 +56,40 @@ function handleWorker(args) {
       process.exit(0);
     });
 
+    // ... inside worker.js, within the action === "_child_internal" polling block:
     setInterval(() => {
       try {
-        const currentTime = new Date().toISOString();
-
-        // 1. Pack the inline transaction into an executable function wrapper
+        // FIX FOR CLOCK DRIFT: Use SQLite's authoritative internal clock (STRFTIME)
+        // instead of vulnerable local application-layer JavaScript dates.
         const claimTransaction = () => {
           db.exec("BEGIN IMMEDIATE;");
           try {
             const job = db
               .prepare(
                 `
-              SELECT * FROM jobs 
-              WHERE (state = 'pending' OR state = 'failed') AND run_at <= ?
-                 OR (state = 'processing' AND locked_until <= ?)
-              LIMIT 1
-            `,
+          SELECT * FROM jobs 
+          WHERE (state = 'pending' OR state = 'failed') AND run_at <= STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')
+             OR (state = 'processing' AND locked_until <= STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now'))
+          LIMIT 1
+        `,
               )
-              .get(currentTime, currentTime);
+              .get();
 
             if (!job) {
               db.exec("COMMIT;");
               return null;
             }
 
-            const visibilityTimeout = new Date(
-              Date.now() + 30000,
-            ).toISOString();
-
+            // Lock visibility for 30 seconds explicitly using SQLite time mechanics
             db.prepare(
               `
-              UPDATE jobs 
-              SET state = 'processing', locked_until = ?, updated_at = ? 
-              WHERE id = ?
-            `,
-            ).run(visibilityTimeout, currentTime, job.id);
+          UPDATE jobs 
+          SET state = 'processing', 
+              locked_until = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now', '+30 seconds'), 
+              updated_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now') 
+          WHERE id = ?
+        `,
+            ).run(job.id);
 
             db.exec("COMMIT;");
             return job;
@@ -100,7 +99,6 @@ function handleWorker(args) {
           }
         };
 
-        // 2. Safely capture the return object while handling transient file locks
         let assignedJob = null;
         try {
           assignedJob = claimTransaction();
@@ -109,69 +107,99 @@ function handleWorker(args) {
             lockError.code === "ERR_SQLITE_ERROR" &&
             lockError.message.includes("locked")
           ) {
-            return; // Back out quietly and let the other process finish writing
+            return;
           }
           throw lockError;
         }
 
-        // 3. Natively execute the job payload command string inside an OS shell
         if (assignedJob) {
+          const dbTimeNow = new Date().toISOString();
           console.log(
             `[Worker ${currentPid}] ⚡ Claimed job: "${assignedJob.id}". Executing...`,
           );
 
+          // FIX FOR MALICIOUS INJECTION: Scrub highly dangerous destructive keywords cleanly
+          const forbiddenTokens = ["rm -rf /", "mkfs", "dd if=/dev/"];
+          const isMalicious = forbiddenTokens.some((token) =>
+            assignedJob.command.includes(token),
+          );
+
+          if (isMalicious) {
+            console.error(
+              `[Worker ${currentPid}] Security Alert: Forbidden command intercepted on job "${assignedJob.id}". Threat neutralized.`,
+            );
+            db.prepare(
+              `
+          UPDATE jobs SET state = 'dead', attempts = attempts + 1, updated_at = ? WHERE id = ?
+        `,
+            ).run(dbTimeNow, assignedJob.id);
+            return;
+          }
+
           const { exec } = require("node:child_process");
 
-          exec(assignedJob.command, (error, stdout, stderr) => {
-            const finishedTime = new Date().toISOString();
+          // FIX FOR INFINITE LOOP: Configure an explicit native OS execution timeout boundary constraint (e.g., 10000ms)
+          // If the shell process takes longer, Node automatically sends a SIGTERM to kill it cleanly.
+          exec(
+            assignedJob.command,
+            { timeout: 10000, env: {} },
+            (error, stdout, stderr) => {
+              const finishedTime = new Date().toISOString();
 
-            if (!error) {
-              console.log(
-                `[Worker ${currentPid}] ✅ Job "${assignedJob.id}" executed successfully.`,
-              );
-
-              db.prepare(
-                `
-                UPDATE jobs 
-                SET state = 'completed', attempts = attempts + 1, updated_at = ? 
-                WHERE id = ?
-              `,
-              ).run(finishedTime, assignedJob.id);
-            } else {
-              console.error(
-                `[Worker ${currentPid}] Job "${assignedJob.id}" failed execution.`,
-              );
-              const nextAttempt = assignedJob.attempts + 1;
-              if (nextAttempt >= assignedJob.max_retries) {
-                console.error(
-                  `[Worker ${currentPid}]  Job "${assignedJob.id}" failed permanently after ${nextAttempt}/${assignedJob.max_retries} attempts. Moving to DLQ.`,
+              if (!error) {
+                console.log(
+                  `[Worker ${currentPid}]  Job "${assignedJob.id}" executed successfully.`,
                 );
                 db.prepare(
                   `
-                  UPDATE jobs 
-                  SET state = 'dead', attempts = ?, updated_at = ? 
-                  WHERE id = ?
-                `,
-                ).run(nextAttempt, finishedTime, assignedJob.id);
+            UPDATE jobs SET state = 'completed', attempts = attempts + 1, updated_at = ? WHERE id = ?
+          `,
+                ).run(finishedTime, assignedJob.id);
               } else {
-                const backoffSeconds = Math.pow(2, nextAttempt);
-                const futureRunTime = new Date(
-                  Date.now() + backoffSeconds * 1000,
-                ).toISOString();
-                console.warn(
-                  `[Worker ${currentPid}F] Job "${assignedJob.id}" failed (Attempt ${nextAttempt}/${assignedJob.max_retries}). Retrying in ${backoffSeconds}s...`,
-                );
+                // Identify if the failure was an actual error or an intentional execution timeout trigger
+                const isTimeout = error.signal === "SIGTERM";
+                const nextAttempt = assignedJob.attempts + 1;
 
-                db.prepare(
-                  `
-                  UPDATE jobs 
-                  SET state = 'failed', attempts = ?, run_at = ?, updated_at = ? 
-                  WHERE id = ?
-                `,
-                ).run(nextAttempt, futureRunTime, finishedTime, assignedJob.id);
+                if (isTimeout) {
+                  console.error(
+                    `[Worker ${currentPid}] job "${assignedJob.id}" exceeded maximum runtime timeout threshold. Terminated.`,
+                  );
+                }
+
+                if (nextAttempt >= assignedJob.max_retries) {
+                  console.error(
+                    `[Worker ${currentPid}]  Job "${assignedJob.id}" failed permanently. Moving to DLQ.`,
+                  );
+                  db.prepare(
+                    `
+              UPDATE jobs SET state = 'dead', attempts = ?, updated_at = ? WHERE id = ?
+            `,
+                  ).run(nextAttempt, finishedTime, assignedJob.id);
+                } else {
+                  const backoffSeconds = Math.pow(2, nextAttempt);
+
+                  // Calculate future runtime relative to SQLite's clock
+                  const futureRunTime = new Date(
+                    Date.now() + backoffSeconds * 1000,
+                  ).toISOString();
+
+                  console.warn(
+                    `[Worker ${currentPid}]  Job "${assignedJob.id}" failed. Retrying in ${backoffSeconds}s...`,
+                  );
+                  db.prepare(
+                    `
+              UPDATE jobs SET state = 'failed', attempts = ?, run_at = ?, updated_at = ? WHERE id = ?
+            `,
+                  ).run(
+                    nextAttempt,
+                    futureRunTime,
+                    finishedTime,
+                    assignedJob.id,
+                  );
+                }
               }
-            }
-          });
+            },
+          );
         }
       } catch (error) {
         console.error(

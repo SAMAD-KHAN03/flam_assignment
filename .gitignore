@@ -3,3 +3,4 @@ queue.db
 queue.db-shm
 queue.db-wal
 result.txt
+test_edge_cases.js
